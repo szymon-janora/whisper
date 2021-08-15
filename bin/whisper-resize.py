@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import itertools
 import operator
 import os
 import sys
@@ -100,35 +101,39 @@ print('Created: %s (%d bytes)' % (newfile, size))
 
 
 def find_new_archive(old_archive, new_archives):
+  """ It finds a new archive to put the old data. """
   old_archive_retention = old_archive['retention']
   old_precision = old_archive['secondsPerPoint']
   best_fit_new_archive = None
+  fit_new_archive = None
   for new_archive in list(new_archives):
     new_precision, new_points = new_archive
     new_retention = new_precision * new_points
+    if new_retention <= old_archive_retention:
+      new_archives.remove(new_archive)
     if new_precision <= old_precision and (old_precision % new_precision) == 0:
       best_fit_new_archive = new_archive
-      if new_retention <= old_archive_retention:
-        new_archives.remove(new_archive)
-      if new_retention >= old_archive_retention:
-        return best_fit_new_archive, None
-    elif new_retention >= old_archive_retention and (new_precision % old_precision) == 0:
-      if new_retention == old_archive_retention:
-        new_archives.remove(new_archive)
-      return best_fit_new_archive, new_archive
-  return best_fit_new_archive, None
+    elif (new_precision % old_precision) == 0:
+      fit_new_archive = new_archive
+    if new_retention >= old_archive_retention:
+      return best_fit_new_archive, fit_new_archive
+  return best_fit_new_archive, fit_new_archive
 
 
 def grouped(n, iterable, fillvalue=None):
-    """grouped(2, [0, 1, 2, 3, 4], None) --> (0, 1) (2, 3) (4, None)"""
-    args = [iter(iterable)] * n
-    return zip_longest(fillvalue=fillvalue, *args)
+  """grouped(2, [0, 1, 2, 3, 4], None) --> (0, 1) (2, 3) (4, None)"""
+  args = [iter(iterable)] * n
+  return zip_longest(fillvalue=fillvalue, *args)
 
 
 def write_datapoints(timeinfo, values):
   datapoints = zip(range(*timeinfo), values)
   datapoints = filter(lambda p: p[1] is not None, datapoints)
   whisper.update_many(newfile, datapoints)
+
+
+def print_datapoints(msg, timeinfo, values):
+  print("%s: timeinfo=%s, len=%s,  %s" % (msg, timeinfo, len(values), [d for d in zip(range(*timeinfo), values)]))
 
 
 print('Migrating all data from the old archives into a new retention')
@@ -141,45 +146,60 @@ for old_archive in old_archives:
 
   # Find a new archvie for old data
   best_fit_new_archive, fit_new_archive = find_new_archive(old_archive, new_archives)
-  old_archive_retention = "%ss:%ss" % (old_archive['secondsPerPoint'], old_archive['retention'])
-  if not best_fit_new_archive and not fit_new_archive:
-    if options.force:
-      print("Migration dropped the old archives from the archive %s!" % old_archive_retention)
-      break
-    else:
-      print("Migration couldn't fit the old archive (%s) into a new retention" % old_archive_retention)
-      sys.exit(1)
-  elif not fit_new_archive:
-    best_retention = best_fit_new_archive[0] * best_fit_new_archive[1]  # best_precision * best_points
-    if best_retention < old_archive['retention'] and not options.force:
-        print("Migration couldn't fit the old archive (%s) into too small new retention (%ss)" % (old_archive_retention, best_retention))
-        sys.exit(1)
-    write_datapoints(old_timeinfo, old_values)
-    continue
+
   old_precision = old_archive['secondsPerPoint']
   start, end, step = old_timeinfo
 
-  # Migrate old data into a best fit new archive
-  best_precision, best_points = best_fit_new_archive
-  best_new_points = int(best_points / (old_precision / best_precision))
-  best_new_values = old_values[len(old_values) - best_new_points:]
-  best_new_timeinfo = (end - (best_new_points * step), end, step)
-  write_datapoints(best_new_timeinfo, best_new_values)
+  # Migrate part of old data into a best fit new archive
+  if best_fit_new_archive:
+    best_precision, best_points = best_fit_new_archive
+    num_of_best_new_points = int(best_points // (old_precision / best_precision))
+    best_values = old_values[-num_of_best_new_points:]
+    best_start = end - (len(best_values) * step)
+    best_new_timeinfo = (best_start, end, step)
+    print_datapoints("old_values put in best fit archive", best_new_timeinfo, best_values)
+    write_datapoints(best_new_timeinfo, best_values)
+    old_values = old_values[:-num_of_best_new_points]
+    end = best_start
 
-  # Migrate old data into a fit new archive
-  fit_precision, fit_points = fit_new_archive
-  num_of_aggregation_points = int(fit_precision / old_precision)
-  fit_values = old_values[:best_new_points]
-  new_values = []
-  for aggregation_values in grouped(num_of_aggregation_points, fit_values):
-    non_none_values = list(filter(lambda x: x is not None, aggregation_values))
-    if non_none_values and 1.0 * len(non_none_values) / len(aggregation_values) >= xff:
-      new_values.append(whisper.aggregate(aggregationMethod,
-                                          non_none_values, aggregation_values))
+  # Migrate part of old data into a fit new archive
+  if fit_new_archive:
+    print_datapoints("old_values to aggregate", old_timeinfo, old_values)
+    fit_precision, fit_points = fit_new_archive
+    end -= step  # move end at the newest datapoint
+    aggregation_time_offset = end % fit_precision  # calculate time offset between old time and new time resolution
+    num_of_aggregation_points = int(fit_precision // old_precision)
+    # Align datapoints into aggregation grouping due to aggregation_time_offset
+    num_of_align_values = int(aggregation_time_offset // old_precision + 1)
+    unaligned_old_values = old_values[-num_of_align_values:]
+    aligned_old_values = old_values[:-num_of_align_values]
+    new_values = []
+    # Aggregate values from a newest datapoint to a oldest datapoint
+    for aggregation_values in itertools.chain([unaligned_old_values],
+                                              grouped(num_of_aggregation_points, reversed(aligned_old_values))):
+      non_none_values = list(filter(lambda x: x is not None, aggregation_values))
+      if non_none_values and 1.0 * len(non_none_values) / len(aggregation_values) >= xff:
+        new_values.append(whisper.aggregate(aggregationMethod,
+                                            non_none_values, aggregation_values))
+      else:
+        new_values.append(None)
+    new_values.reverse()
+    end = end - aggregation_time_offset + fit_precision
+    new_timeinfo = (end - len(new_values) * fit_precision, end, fit_precision)
+    print_datapoints("aggregated old_values", new_timeinfo, new_values)
+    write_datapoints(new_timeinfo, new_values)
+    old_values = []
+
+  if len(old_values) > 0:
+    old_archive_retention = "%ss:%ss" % (old_archive['secondsPerPoint'], old_archive['retention'])
+    if options.force:
+      print("Migration dropped the old archives from the archive %s (%s datapoints were dropped)!"
+            % (old_archive_retention, len(old_values)))
+      break
     else:
-      new_values.append(None)
-  new_timeinfo = (start, start + len(new_values) * fit_precision, fit_precision)
-  write_datapoints(new_timeinfo, new_values)
+      print("Migration couldn't fit the old archive (%s) into a new retention" % old_archive_retention)
+      os.unlink(newfile)
+      sys.exit(1)
 
 if options.newfile is not None:
   sys.exit(0)
